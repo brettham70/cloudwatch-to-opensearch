@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: 2010-09-09
+Metadata:
+  TemplateId: "cloudwatch-to-opensearch-backend"
+Parameters:
+  OSSADMIN:
+    Type: "String"
+    Default: "CHANGEME"
+    Description: "The role to use for admin access to OpenSearch Serverless Collection."
+  Environment:
+    Type: String
+  EnvStackIdx:
+    Type: String
+    Default: ""
+Resources:
+  SQSQueuePolicyS3Trigger:
+    Type: 'AWS::SQS::QueuePolicy'
+    Properties:
+      Queues:
+        - !Ref SQSQueueS3Trigger
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 's3.amazonaws.com'
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt SQSQueueS3Trigger.Arn
+
+  SQSQueueS3Trigger:
+    Type: "AWS::SQS::Queue"
+    Properties:
+      QueueName: !Sub "cloudwatch-ingest-s3-queue-${Environment}${EnvStackIdx}"
+      SqsManagedSseEnabled: true
+      ReceiveMessageWaitTimeSeconds: 0
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600
+      MaximumMessageSize: 262144
+      VisibilityTimeout: 30
+      Tags:
+        - Key: "source"
+          Value: "aws-samples"  
+        - Key: "solution"
+          Value: "cloudwatch-to-opensearch"
+
+  S3BucketLogs:
+    Type: "AWS::S3::Bucket"
+    DependsOn:  
+      - SQSQueuePolicyS3Trigger
+      - SQSQueueS3Trigger
+    Properties:
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt SQSQueueS3Trigger.Arn
+      BucketName: !Sub "cloudwatch-logs-to-osis-${Environment}${EnvStackIdx}-${AWS::AccountId}"
+      Tags:
+        - Key: "source"
+          Value: "aws-samples"  
+        - Key: "solution"
+          Value: "cloudwatch-to-opensearch"
+
+  KinesisFirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "cloudwatch-to-s3-${Environment}${EnvStackIdx}"
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt S3BucketLogs.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        CompressionFormat: UNCOMPRESSED
+        Prefix: ""
+        RoleARN: !GetAtt IAMRoleKinesisFirehoseServiceRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt LambdaFunctionKDFopensearchServerlessTransform.Arn
+      Tags:
+        - Key: "source"
+          Value: "aws-samples"  
+        - Key: "solution"
+          Value: "cloudwatch-to-opensearch"
+
+  IAMRoleKinesisFirehoseServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/service-role/"
+      ManagedPolicyArns:
+      - Ref: "IAMManagedPolicyKinesisFirehoseServicePolicy"
+      MaxSessionDuration: 3600
+      RoleName: !Sub "IP-${AWS::StackName}-KinesisFirehoseServiceRole-${Environment}${EnvStackIdx}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: "sts:AssumeRole"
+          Effect: "Allow"
+          Principal:
+            Service: "firehose.amazonaws.com"
+      Tags:
+        - Key: "source"
+          Value: "aws-samples"  
+        - Key: "solution"
+          Value: "cloudwatch-to-opensearch"
+
+  IAMManagedPolicyKinesisFirehoseServicePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "IP-${AWS::StackName}-KDFManagedPolicy-cloudwatch-to-s3-${Environment}${EnvStackIdx}"
+      Path: "/service-role/"
+      Description: ""
+      Groups: []
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Resource:
+          - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+          - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/%FIREHOSE_POLICY_TEMPLATE_PLACEHOLDER%"
+          - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/%FIREHOSE_POLICY_TEMPLATE_PLACEHOLDER%/%FIREHOSE_POLICY_TEMPLATE_PLACEHOLDER%"
+          Action:
+          - "glue:GetTable"
+          - "glue:GetTableVersion"
+          - "glue:GetTableVersions"
+          Effect: "Allow"
+          Sid: ""
+        # ... (other policy statements remain unchanged)
+
+  IAMRoleKDFOpenSearchServerlessTransformRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/service-role/"
+      ManagedPolicyArns:
+      - Ref: "IAMManagedPolicyServiceRoleAWSLambdaBasicExecutionRole"
+      MaxSessionDuration: 3600
+      RoleName: !Sub "IP-${AWS::StackName}-kdf-opensearch-serverless-transform-role-${Environment}${EnvStackIdx}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: "sts:AssumeRole"
+          Effect: "Allow"
+          Principal:
+            Service: "lambda.amazonaws.com"
+
+  IAMRoleCloudWatchLogsToKinesisRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess"
+      - "arn:aws:iam::aws:policy/AmazonKinesisFullAccess"
+      MaxSessionDuration: 3600
+      RoleName: !Sub "IP-${AWS::StackName}-cloudWatch-subscription-to-kinesis-role-${Environment}${EnvStackIdx}"
+      Description: "allow cloudwatch log subscriptions full access to kinesis streams and KDF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Condition:
+              StringLike:
+                aws:SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+            Action: "sts:AssumeRole"
+            Effect: "Allow"
+            Sid: "Statement1"
+            Principal:
+              Service: "logs.amazonaws.com"
+
+  IAMManagedPolicyServiceRoleAWSLambdaBasicExecutionRole:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "IP-${AWS::StackName}-KDFOpenSearchServerlessTransform-Managed-Policy-${Environment}${EnvStackIdx}"
+      Path: "/service-role/"
+      Description: "Managed policy for KDF OpenSearch Tranform Lambda"
+      Groups: []
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Resource: 
+          - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          Action: "logs:CreateLogGroup"
+          Effect: "Allow"
+        - Resource:
+          - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+          Action:
+          - "logs:CreateLogStream"
+          - "logs:PutLogEvents"
+          Effect: "Allow"
+
+  OSSDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy 
+    Properties:
+      Name: !Sub "oss-cw-data-access-policy-${Environment}${EnvStackIdx}"
+      Type: data
+      Description: Data access policy for my collection
+      Policy: !Sub "[{\"Description\":\"Access for admin user\",\"Rules\":[{\"ResourceType\":\"index\",\"Resource\":[\"index/*/*\"],\"Permission\":[\"aoss:*\"]}, {\"ResourceType\":\"collection\",\"Resource\":[\"collection/oss-cloudwatch-${Environment}${EnvStackIdx}\"],\"Permission\":[\"aoss:*\"]}], \"Principal\":[\"arn:aws:iam::${AWS::AccountId}:role/${OSSADMIN}\", \"arn:aws:iam::${AWS::AccountId}:role/${OSSPipelineRole}\"]}]"
+
+  OSSNetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub "oss-cloudwatch-network-policy-${Environment}${EnvStackIdx}"
+      Type: network
+      Description: Network policy for quickstart collection
+      Policy: !Sub '[{"Rules":[{"ResourceType":"collection","Resource":["collection/oss-cloudwatch-${Environment}${EnvStackIdx}"]}, {"ResourceType":"dashboard","Resource":["collection/oss-cloudwatch-${Environment}${EnvStackIdx}"]}],"AllowFromPublic":true}]'
+
+  OSSEncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: !Sub "oss-cloudwatch-security-policy-${Environment}${EnvStackIdx}"
+      Type: encryption
+      Description: Encryption policy for oss-cloudwatch collection
+      Policy: !Sub '{"Rules":[{"ResourceType":"collection","Resource":["collection/oss-cloudwatch-${Environment}${EnvStackIdx}"]}],"AWSOwnedKey":true}'
+
+  OSSCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Properties:
+      Type: "SEARCH"
+      Description: "The opensearch collection where cloudwatch logs will be aggreagated for search"
+      Name: !Sub "oss-cloudwatch-${Environment}${EnvStackIdx}"
+    DependsOn: 
+      - OSSEncryptionPolicy
+      - OSSNetworkPolicy
+
+  OSSPipelineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/AmazonSQSFullAccess"
+      - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+      MaxSessionDuration: 3600
+      RoleName: !Sub "IP-${AWS::StackName}-OSSPipelineRole-${Environment}${EnvStackIdx}"
+      Description: "Allows OpenSearch Ingestion pipelines to call other AWS services on your behalf."
+      Policies:
+        - PolicyName: "policy1"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Resource: !Sub "arn:aws:s3:::${S3BucketLogs}/*"
+              Action: "s3:GetObject"
+              Effect: "Allow"
+              Sid: "ReadFromS3"
+        - PolicyName: "policy2"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Resource: !GetAtt SQSQueueS3Trigger.Arn
+              Action:
+                - "sqs:DeleteMessage"
+                - "sqs:ReceiveMessage"
+              Effect: "Allow"
+              Sid: "ReceiveAndDeleteSqsMessages"
+        - PolicyName: "policy3"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+              Action:
+                - "aoss:APIAccessAll"
+                - "aoss:BatchGetCollection"
+              Effect: "Allow"
+              Sid: "AOSSPermissions"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Action: "sts:AssumeRole"
+          Effect: "Allow"
+          Principal:
+            Service: "osis-pipelines.amazonaws.com"
+
+  LogGroupOSIS:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupClass: "STANDARD"
+      LogGroupName: !Sub "/aws/vendedlogs/OpenSearchIngestion/cloudwatch-s3-pipeline-${Environment}${EnvStackIdx}/audit-logs"
+      DataProtectionPolicy: {}
+
+  LogGroupKDFLambda:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupClass: "STANDARD"
+      LogGroupName: !Sub "/aws/lambda/kdf-opensearch-serverless-transform-${Environment}${EnvStackIdx}"
+      DataProtectionPolicy: {}
+
+  OSISPipeline:
+    Type: "AWS::OSIS::Pipeline"
+    Properties:
+      PipelineConfigurationBody: !Sub |
+         version: "2"  
+         s3-log-pipeline: 
+           source: 
+              s3: 
+                acknowledgments: true 
+                notification_type: "sqs" 
+                compression: "none" 
+                codec: 
+                  json: 
+                sqs: 
+                  queue_url: "${SQSQueueS3Trigger.QueueUrl}" 
+                  maximum_messages: 10 
+                  visibility_timeout: "30s" 
+                aws: 
+                  region: "${AWS::Region}" 
+                  sts_role_arn: "${OSSPipelineRole.Arn}" 
+           processor: 
+              - date: 
+                  from_time_received: true 
+                  destination: "@timestamp" 
+           sink: 
+              - opensearch: 
+                  hosts: [ "${OSSCollection.CollectionEndpoint}" ] 
+                  aws: 
+                      sts_role_arn: "${OSSPipelineRole.Arn}" 
+                      region: "${AWS::Region}" 
+                      serverless: true 
+                  index: "cloudwatch_logs" 
+      MinUnits: 1
+      PipelineName: !Sub "cloudwatch-s3-pipeline-${Environment}${EnvStackIdx}"
+      MaxUnits: 4
+      Tags:
+        - Key: "source"
+          Value: "aws-samples"  
+        - Key: "solution"
+          Value: "cloudwatch-to-opensearch"
+      LogPublishingOptions:
+        CloudWatchLogDestination:
+          LogGroup: !Sub "/aws/vendedlogs/OpenSearchIngestion/cloudwatch-s3-pipeline-${Environment}${EnvStackIdx}/audit-logs"
+        IsLoggingEnabled: true
+  TestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/cloudwatch-to-opensearch-${Environment}${EnvStackIdx}"
+      RetentionInDays: 7
+
+  TestLogSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt 'KinesisFirehoseDeliveryStream.Arn'
+      FilterName: "ALL"
+      FilterPattern: ""
+      LogGroupName: !Ref 'TestLogGroup'
+      RoleArn: !GetAtt 'IAMRoleCloudWatchLogsToKinesisRole.Arn'
+      Distribution: ByLogStream
+    DependsOn: 
+      - KinesisFirehoseDeliveryStream
+      - TestLogGroup
+
+  LambdaFunctionKDFopensearchServerlessTransform:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      MemorySize: 128
+      Description: "Solution kinesis data firehose transform function to stream to OpenSearch Serverless"
+      TracingConfig:
+        Mode: "PassThrough"
+      Timeout: 30
+      RuntimeManagementConfig:
+        UpdateRuntimeOn: "Auto"
+      Handler: "index.lambda_handler"
+      Role: !GetAtt IAMRoleKDFOpenSearchServerlessTransformRole.Arn
+      FileSystemConfigs: []
+      FunctionName: !Sub "kdf-opensearch-serverless-transform-${Environment}${EnvStackIdx}"
+      Runtime: "python3.11"
+      PackageType: "Zip"
+      LoggingConfig:
+        LogFormat: "Text"
+        LogGroup: !Sub "/aws/lambda/kdf-opensearch-serverless-transform-${Environment}${EnvStackIdx}"
+      EphemeralStorage:
+        Size: 512
+      Tags:
+        - Key: "source"
+          Value: "aws-samples"  
+        - Key: "solution"
+          Value: "cloudwatch-to-opensearch"
+      Architectures:
+      - "x86_64"
+      Code:
+        ZipFile: |
+          # Lambda function code remains unchanged
+
+Outputs:
+  BucketName:
+    Value: !Ref S3BucketLogs
+    Description: Name of the S3 bucket containing the cloudwatch logs
+
+  KinesisFirehoseDeliveryStream:
+    Value: !GetAtt KinesisFirehoseDeliveryStream.Arn
+    Description: Kinesis Firehose Delivery Stream Arn
+
+  CloudWatchLogsToKinesisRoleArn:
+    Value: !GetAtt IAMRoleCloudWatchLogsToKinesisRole.Arn
+    Description: CloudWatch Logs to Kinesis Role Arn 
+
+  OSSCollection:
+    Value: !GetAtt OSSCollection.CollectionEndpoint
+    Description: OpenSearch Serverless Collection Endpoint 

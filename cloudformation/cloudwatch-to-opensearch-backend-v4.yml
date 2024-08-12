@@ -1,4 +1,6 @@
 AWSTemplateFormatVersion: 2010-09-09
+Description: "This template sets up the backend infrastructure for streaming CloudWatch logs to OpenSearch. It includes resources for S3, SQS, Kinesis Firehose, IAM roles, Lambda functions, and OpenSearch Serverless."
+
 Metadata:
   TemplateId: "cloudwatch-to-opensearch-backend"
 Parameters:
